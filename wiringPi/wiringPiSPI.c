@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 #include <linux/spi/spidev.h>
 
 #include "wiringPi.h"
@@ -73,6 +74,9 @@ int wiringPiSPIDataRW (int channel, unsigned char *data, int len)
   struct spi_ioc_transfer spi ;
 
   channel &= 1 ;
+
+  if (spiFds    [channel] < 0)
+    return wiringPiFailure (WPI_FATAL, "SPI not setup") ;
 
 // Mentioned in spidev.h but not used in the original kernel documentation
 //	test program )-:
@@ -134,3 +138,17 @@ int wiringPiSPISetup (int channel, int speed)
 {
   return wiringPiSPISetupMode (channel, speed, 0) ;
 }
+
+/*
+ * wiringPiSPIClose:
+ *	Close the SPI device
+ *********************************************************************************
+ */
+
+int wiringPiSPIClose     (int channel)
+ {
+	int ret = close(spiFds    [channel]);
+	spiFds    [channel] = -1 ;
+	spiSpeeds [channel] = 0 ;
+	return ret;
+ }

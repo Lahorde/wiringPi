@@ -573,6 +573,14 @@ static uint8_t gpioToClkDiv [] =
          -1,        -1,        -1,        -1,        -1,        -1,        -1,        -1,	// 56 -> 63
 } ;
 
+/*
+ * Static functions declarations
+ *********************************************************************************
+ */
+static int changeGPIOEdge (int bcmGpioPin, int mode) ;
+static int wiringPiToBCMGPIO (int pin) ;
+
+
 
 /*
  * Functions
@@ -1602,64 +1610,16 @@ static void *interruptHandler (void *arg)
 int wiringPiISR (int pin, int mode, void (*function)(void*), void* payload)
 {
   pthread_t threadId ;
-  const char *modeS ;
   char fName   [64] ;
-  char  pinS [8] ;
-  pid_t pid ;
   int   count, i ;
   char  c ;
   int   bcmGpioPin ;
 
-  if ((pin < 0) || (pin > 63))
-    return wiringPiFailure (WPI_FATAL, "wiringPiISR: pin must be 0-63 (%d)\n", pin) ;
+	bcmGpioPin = wiringPiToBCMGPIO(pin);
+	if(bcmGpioPin < 0)
+		return wiringPiFailure (WPI_FATAL, "wiringPiISR: Invalid pin given.\n") ;
 
-  /**/ if (wiringPiMode == WPI_MODE_UNINITIALISED)
-    return wiringPiFailure (WPI_FATAL, "wiringPiISR: wiringPi has not been initialised. Unable to continue.\n") ;
-  else if (wiringPiMode == WPI_MODE_PINS)
-    bcmGpioPin = pinToGpio [pin] ;
-  else if (wiringPiMode == WPI_MODE_PHYS)
-    bcmGpioPin = physToGpio [pin] ;
-  else
-    bcmGpioPin = pin ;
-
-// Now export the pin and set the right edge
-//	We're going to use the gpio program to do this, so it assumes
-//	a full installation of wiringPi. It's a bit 'clunky', but it
-//	is a way that will work when we're running in "Sys" mode, as
-//	a non-root user. (without sudo)
-
-  if (mode != INT_EDGE_SETUP)
-  {
-    /**/ if (mode == INT_EDGE_FALLING)
-      modeS = "falling" ;
-    else if (mode == INT_EDGE_RISING)
-      modeS = "rising" ;
-    else
-      modeS = "both" ;
-
-    sprintf (pinS, "%d", bcmGpioPin) ;
-
-    if ((pid = fork ()) < 0)	// Fail
-      return wiringPiFailure (WPI_FATAL, "wiringPiISR: fork failed: %s\n", strerror (errno)) ;
-
-    if (pid == 0)	// Child, exec
-    {
-      /**/ if (access ("/usr/local/bin/gpio", X_OK) == 0)
-      {
-	execl ("/usr/local/bin/gpio", "gpio", "edge", pinS, modeS, (char *)NULL) ;
-	return wiringPiFailure (WPI_FATAL, "wiringPiISR: execl failed: %s\n", strerror (errno)) ;
-      }
-      else if (access ("/usr/bin/gpio", X_OK) == 0)
-      {
-	execl ("/usr/bin/gpio", "gpio", "edge", pinS, modeS, (char *)NULL) ;
-	return wiringPiFailure (WPI_FATAL, "wiringPiISR: execl failed: %s\n", strerror (errno)) ;
-      }
-      else
-	return wiringPiFailure (WPI_FATAL, "wiringPiISR: Can't find gpio program\n") ;
-    }
-    else		// Parent, wait
-      wait (NULL) ;
-  }
+  changeGPIOEdge(bcmGpioPin, mode);
 
 // Now pre-open the /sys/class node - but it may already be open if
 //	we are in Sys mode...
@@ -1681,15 +1641,111 @@ int wiringPiISR (int pin, int mode, void (*function)(void*), void* payload)
   isrCallbacks[pin].payload = payload ;
 
   pthread_mutex_lock (&pinMutex) ;
-    pinPass = pin ;
-    pthread_create (&threadId, NULL, interruptHandler, NULL) ;
-    while (pinPass != -1)
-      delay (1) ;
+	pinPass = pin ;
+	pthread_create (&threadId, NULL, interruptHandler, NULL) ;
+	while (pinPass != -1)
+		delay (1) ;
   pthread_mutex_unlock (&pinMutex) ;
 
   return 0 ;
 }
 
+/*
+ * detachInterrupt:
+ *	Detach interrupt on given pin.
+ *	'dirty' way => thread listening in it not killed
+ *********************************************************************************
+ */
+int  detachInterrupt     (int pin)
+{
+	int bcmGpioPin = wiringPiToBCMGPIO(pin);
+	if(bcmGpioPin < 0)
+		return wiringPiFailure (WPI_FATAL, "changeGPIOEdge: Invalid pin given.\n") ;
+
+	changeGPIOEdge(bcmGpioPin, INT_EDGE_NONE);
+  isrCallbacks[pin].isrFunction = NULL ;
+  isrCallbacks[pin].payload = NULL ;
+	return 0;
+}
+
+
+
+/*
+ * Change GPIO edge using gpio utility
+ *********************************************************************************
+ */
+int changeGPIOEdge (int bcmGpioPin, int mode){
+	pid_t pid ;
+	const char *modeS ;
+	char  pinS [8] ;
+
+	sprintf (pinS, "%d", bcmGpioPin) ;
+
+	// Now export the pin and set the right edge
+	//	We're going to use the gpio program to do this, so it assumes
+	//	a full installation of wiringPi. It's a bit 'clunky', but it
+	//	is a way that will work when we're running in "Sys" mode, as
+	//	a non-root user. (without sudo)
+  if (mode != INT_EDGE_SETUP)
+  {
+    /**/ if (mode == INT_EDGE_FALLING)
+      modeS = "falling" ;
+    else if (mode == INT_EDGE_RISING)
+      modeS = "rising" ;
+    else if (mode == INT_EDGE_NONE)
+      modeS = "none" ;
+    else if (mode == INT_EDGE_BOTH)
+      modeS = "both" ;
+    else
+    	return wiringPiFailure (WPI_FATAL, "Bad parameter given for mode %d", mode) ;
+
+    if ((pid = fork ()) < 0)	// Fail
+      return wiringPiFailure (WPI_FATAL, "wiringPiISR: fork failed: %s\n", strerror (errno)) ;
+
+    if (pid == 0)	// Child, exec
+    {
+      /**/ if (access ("/usr/local/bin/gpio", X_OK) == 0)
+      {
+      	execl ("/usr/local/bin/gpio", "gpio", "edge", pinS, modeS, (char *)NULL) ;
+      	return wiringPiFailure (WPI_FATAL, "wiringPiISR: execl failed: %s\n", strerror (errno)) ;
+      }
+      else if (access ("/usr/bin/gpio", X_OK) == 0)
+      {
+      	execl ("/usr/bin/gpio", "gpio", "edge", pinS, modeS, (char *)NULL) ;
+      	return wiringPiFailure (WPI_FATAL, "wiringPiISR: execl failed: %s\n", strerror (errno)) ;
+      }
+      else
+      	return wiringPiFailure (WPI_FATAL, "wiringPiISR: Can't find gpio program\n") ;
+    }
+    else		// Parent, wait
+      wait (NULL) ;
+  }
+	return 0;
+}
+
+/*
+ * Convert given wiringPi pin to bcmGPIO
+ *********************************************************************************
+ */
+int wiringPiToBCMGPIO (int pin)
+{
+
+	int bcmGpioPin;
+
+	if ((pin < 0) || (pin > 63))
+	    return wiringPiFailure (WPI_FATAL, "wiringPiISR: pin must be 0-63 (%d)\n", pin) ;
+
+	if (wiringPiMode == WPI_MODE_UNINITIALISED)
+		return wiringPiFailure (WPI_FATAL, "wiringPiISR: wiringPi has not been initialised. Unable to continue.\n") ;
+	else if (wiringPiMode == WPI_MODE_PINS)
+		bcmGpioPin = pinToGpio [pin] ;
+	else if (wiringPiMode == WPI_MODE_PHYS)
+		bcmGpioPin = physToGpio [pin] ;
+	else
+		bcmGpioPin = pin ;
+
+	return bcmGpioPin;
+}
 
 /*
  * initialiseEpoch:

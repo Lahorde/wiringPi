@@ -66,6 +66,7 @@
 #define	INT_EDGE_FALLING	1
 #define	INT_EDGE_RISING		2
 #define	INT_EDGE_BOTH		3
+#define	INT_EDGE_NONE		4
 
 // Pi model types and version numbers
 //	Intended for the GPIO program Use at your own risk.
@@ -199,6 +200,7 @@ extern void gpioClockSet        (int pin, int freq) ;
 
 extern int  waitForInterrupt    (int pin, int mS) ;
 extern int  wiringPiISR         (int pin, int mode, void (*function)(void*), void* payload) ;
+extern int  detachInterrupt     (int pin) ;
 
 // Threads
 

@@ -268,7 +268,7 @@ typedef struct{
 }isrCallbackStruct;
 
 static isrCallbackStruct isrCallbacks[64] ;
-
+static u_int8_t pinDetach[64] = {0};
 
 // Doing it the Arduino way with lookup tables...
 //	Yes, it's probably more innefficient than all the bit-twidling, but it
@@ -1586,14 +1586,23 @@ static void *interruptHandler (void *arg)
 {
   int myPin ;
 
+  pthread_detach(pthread_self());
   (void)piHiPri (55) ;	// Only effective if we run as root
 
   myPin   = pinPass ;
   pinPass = -1 ;
 
   for (;;)
-    if (waitForInterrupt (myPin, -1) > 0)
+  {
+    if (waitForInterrupt (myPin, 10) > 0 && !pinDetach[myPin]){
       isrCallbacks[myPin].isrFunction(isrCallbacks[myPin].payload);
+    }
+    else if(pinDetach[myPin] == TRUE)
+    {
+    	pinDetach[myPin] = FALSE;
+    	pthread_exit(NULL);
+    }
+  }
 
   return NULL ;
 }
@@ -1614,12 +1623,16 @@ int wiringPiISR (int pin, int mode, void (*function)(void*), void* payload)
   int   count, i ;
   char  c ;
   int   bcmGpioPin ;
+  int ret = 0;
 
 	bcmGpioPin = wiringPiToBCMGPIO(pin);
 	if(bcmGpioPin < 0)
-		return wiringPiFailure (WPI_FATAL, "wiringPiISR: Invalid pin given.\n") ;
+		return wiringPiFailure (WPI_FATAL, "wiringPiISR: Invalid pin given - error : %d\n", bcmGpioPin) ;
 
-  changeGPIOEdge(bcmGpioPin, mode);
+  ret = changeGPIOEdge(bcmGpioPin, mode);
+	if(ret < 0){
+		return wiringPiFailure (WPI_ALMOST, "error %d when setting gpio edge\n", ret) ;
+	}
 
 // Now pre-open the /sys/class node - but it may already be open if
 //	we are in Sys mode...
@@ -1642,7 +1655,12 @@ int wiringPiISR (int pin, int mode, void (*function)(void*), void* payload)
 
   pthread_mutex_lock (&pinMutex) ;
 	pinPass = pin ;
-	pthread_create (&threadId, NULL, interruptHandler, NULL) ;
+	ret = pthread_create (&threadId, NULL, interruptHandler, NULL) ;
+	if(ret != 0){
+		pthread_mutex_unlock (&pinMutex) ;
+		return wiringPiFailure (WPI_FATAL, "wiringPiISR: unable to create isr thread %s\n", strerror (errno)) ;
+	}
+
 	while (pinPass != -1)
 		delay (1) ;
   pthread_mutex_unlock (&pinMutex) ;
@@ -1659,10 +1677,17 @@ int wiringPiISR (int pin, int mode, void (*function)(void*), void* payload)
 int  detachInterrupt     (int pin)
 {
 	int bcmGpioPin = wiringPiToBCMGPIO(pin);
-	if(bcmGpioPin < 0)
-		return wiringPiFailure (WPI_FATAL, "changeGPIOEdge: Invalid pin given.\n") ;
+	int ret = 0;
 
-	changeGPIOEdge(bcmGpioPin, INT_EDGE_NONE);
+	if(bcmGpioPin < 0)
+		return wiringPiFailure (WPI_FATAL, "detachInterrupt: Invalid pin given - error : %d\n", bcmGpioPin) ;
+
+	pinDetach[pin] = TRUE;
+
+	ret = changeGPIOEdge(bcmGpioPin, INT_EDGE_NONE);
+	if(ret < 0){
+		return wiringPiFailure (WPI_ALMOST, "error %d when setting gpio edge\n", ret) ;
+	}
   isrCallbacks[pin].isrFunction = NULL ;
   isrCallbacks[pin].payload = NULL ;
 	return 0;

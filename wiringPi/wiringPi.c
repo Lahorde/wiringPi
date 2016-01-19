@@ -265,10 +265,16 @@ static int sysFds [64] =
 typedef struct{
   void (*isrFunction)(void*);
   void* payload;
+  int pipeFd[2];
+
 }isrCallbackStruct;
 
+typedef enum{
+	DETACH = 'd',
+	START  = 'c'
+}EITThreadMess;
+
 static isrCallbackStruct isrCallbacks[64] ;
-static u_int8_t pinDetach[64] = {0};
 
 // Doing it the Arduino way with lookup tables...
 //	Yes, it's probably more innefficient than all the bit-twidling, but it
@@ -1543,34 +1549,81 @@ void digitalWriteByte (int value)
 int waitForInterrupt (int pin, int mS)
 {
   int fd, x ;
-  uint8_t c ;
-  struct pollfd polls ;
+  uint8_t buff[8] ;
+  struct pollfd polls[2] ;
+  int bcmPin;
+  ssize_t nbBytes;
 
   /**/ if (wiringPiMode == WPI_MODE_PINS)
-    pin = pinToGpio [pin] ;
+  	bcmPin = pinToGpio [pin] ;
   else if (wiringPiMode == WPI_MODE_PHYS)
-    pin = physToGpio [pin] ;
+  	bcmPin = physToGpio [pin] ;
+  else
+  	bcmPin = pin;
 
-  if ((fd = sysFds [pin]) == -1)
+  if ((fd = sysFds [bcmPin]) == -1)
     return -2 ;
 
 // Setup poll structure
 
-  polls.fd     = fd ;
-  polls.events = POLLPRI ;	// Urgent data!
+  /** polling on interrupt */
+  polls[0].fd     = fd ;
+  polls[0].events = POLLPRI ;	// Urgent data!
 
-// Wait for it ...
+  /** polling on "detachIt" input end of pipe used to cancel polling */
+  polls[1].fd     = isrCallbacks[pin].pipeFd[0] ;
+  polls[1].events = POLLIN ;
 
-  x = poll (&polls, 1, mS) ;
+  /** clear interrupt */
+	lseek (fd, 0, SEEK_SET) ;
+	(void)read (fd, buff, sizeof buff) ;
 
-// Do a dummy read to clear the interrupt
-//	A one character read appars to be enough.
-//	Followed by a seek to reset it.
+  // Wait for it ...
+  x = poll (polls, 2, mS) ;
 
-  (void)read (fd, &c, 1) ;
-  lseek (fd, 0, SEEK_SET) ;
+  if(x < 0)
+  {
+  	return wiringPiFailure (WPI_ALMOST, "waitForInterrupt - error when polling  %s\n", strerror (x)) ;
+  }
+  else if(x == 0) /** timeout */
+  {
+  	return 0;
+  }
+  else if((polls[0].revents > 0) && (polls[0].revents & POLLPRI) ) /** IT */
+  {
+  	/** clear interrupt */
+  	lseek (fd, 0, SEEK_SET) ;
+  	(void)read (fd, buff, sizeof buff) ;
 
-  return x ;
+			
+			return 1;
+  }
+  else if((polls[1].revents > 0) && (polls[1].revents & POLLIN)) /** Detach */
+  {
+  	nbBytes = read(polls[1].fd, buff, sizeof buff);
+  	if(nbBytes == 1 && buff[0] == DETACH) /** Detach pipe */
+  	{
+  	}
+  	else
+  	{
+  		wiringPiFailure (WPI_FATAL, "waitForInterrupt: invalid signal get -nb Bytes = %d - signal = %c\n",
+  				nbBytes,
+					buff[0]) ;
+  	}
+
+  	/** detach it! */
+  	close(isrCallbacks[pin].pipeFd[0]);
+  	close(isrCallbacks[pin].pipeFd[1]);
+  	return 2;
+  }
+  else /** other error */
+  {
+  	/** detach it! */
+  	close(isrCallbacks[pin].pipeFd[0]);
+  	close(isrCallbacks[pin].pipeFd[1]);
+  	/** error on file descriptor - return general error */
+  	return -1;
+  }
 }
 
 
@@ -1585,6 +1638,9 @@ int waitForInterrupt (int pin, int mS)
 static void *interruptHandler (void *arg)
 {
   int myPin ;
+  int ret;
+  ssize_t nbBytes;
+  uint8_t buff[8];
 
   pthread_detach(pthread_self());
   (void)piHiPri (55) ;	// Only effective if we run as root
@@ -1592,14 +1648,57 @@ static void *interruptHandler (void *arg)
   myPin   = pinPass ;
   pinPass = -1 ;
 
+  /** wait for start signal */
+  struct pollfd polls[1] ;
+  /** polling on start signal */
+  polls[0].fd     = isrCallbacks[myPin].pipeFd[0] ;
+  polls[0].events = POLLIN ;
+  // Wait for it ...
+
+  ret = poll (polls, 1, -1) ;
+
+  if(ret < 0)
+  {
+
+  }
+  else if((polls[0].revents > 0) && (polls[0].revents & POLLIN)) /** Signal to start IT */
+  {
+  	nbBytes = read(isrCallbacks[myPin].pipeFd[0], buff, sizeof buff);
+  	if(nbBytes == 1 && buff[0] == START) /** start interrupt catching */
+  	{
+  	}
+  	else /** other message */
+  	{
+    	close(isrCallbacks[myPin].pipeFd[0]);
+    	close(isrCallbacks[myPin].pipeFd[1]);
+  		pthread_exit(NULL);
+  		return NULL;
+  	}
+  }
+  else /** other errors */
+  {
+  	close(isrCallbacks[myPin].pipeFd[0]);
+  	close(isrCallbacks[myPin].pipeFd[1]);
+  	pthread_exit(NULL);
+  	return NULL;
+  }
+
   for (;;)
   {
-    if (waitForInterrupt (myPin, 10) > 0 && !pinDetach[myPin]){
-      isrCallbacks[myPin].isrFunction(isrCallbacks[myPin].payload);
-    }
-    else if(pinDetach[myPin] == TRUE)
+  	ret = waitForInterrupt (myPin, -1);
+  	if (ret == 1 ) /** Interrupt occured */
     {
-    	pinDetach[myPin] = FALSE;
+    	if(isrCallbacks[myPin].isrFunction == NULL)
+    	{
+    		wiringPiFailure (WPI_FATAL, "interruptHandler: callback is null\n") ;
+    		pthread_exit(NULL);
+    		return NULL;
+    	}
+    	isrCallbacks[myPin].isrFunction(isrCallbacks[myPin].payload);
+    	/** continue waiting for interrupts - interrupts polling only stopped if detach called */
+    }
+    else /** it detached or error */
+    {
     	pthread_exit(NULL);
     }
   }
@@ -1613,6 +1712,8 @@ static void *interruptHandler (void *arg)
  *	Pi Specific.
  *	Take the details and create an interrupt handler that will do a call-
  *	back to the user supplied function.
+ *	This methods takes some times to return (~15ms on a raspberry 2). Interrupt
+ *	handling will only be effective after call to wiringPiISRStart()
  *********************************************************************************
  */
 
@@ -1644,6 +1745,11 @@ int wiringPiISR (int pin, int mode, void (*function)(void*), void* payload)
       return wiringPiFailure (WPI_FATAL, "wiringPiISR: unable to open %s: %s\n", fName, strerror (errno)) ;
   }
 
+  if(isrCallbacks[pin].isrFunction != NULL || isrCallbacks[pin].payload != NULL)
+  {
+  	return wiringPiFailure (WPI_FATAL, "wiringPiISR: ISR on pin %d already registered\n", pin) ;
+  }
+
 // Clear any initial pending interrupt
 
   ioctl (sysFds [bcmGpioPin], FIONREAD, &count) ;
@@ -1654,6 +1760,13 @@ int wiringPiISR (int pin, int mode, void (*function)(void*), void* payload)
   isrCallbacks[pin].payload = payload ;
 
   pthread_mutex_lock (&pinMutex) ;
+
+  /** use pipe to stop polling thread using read end of pipe */
+  if(pipe(isrCallbacks[pin].pipeFd))
+  {
+  	return wiringPiFailure (WPI_FATAL, "%s err when creating pipe", strerror(errno));
+  }
+
 	pinPass = pin ;
 	ret = pthread_create (&threadId, NULL, interruptHandler, NULL) ;
 	if(ret != 0){
@@ -1669,6 +1782,29 @@ int wiringPiISR (int pin, int mode, void (*function)(void*), void* payload)
 }
 
 /*
+ * wiringPiISRStart:
+ *	Pi Specific.
+ *	wiringPiISR method take some precious time before returning. During this time,
+ *	some IT can be definitely lost. In order to control IT catching, wiringPiISRStart
+ *	must be called after wiringPiISR, it starts IT handling.
+ *********************************************************************************/
+ int  wiringPiISRStart    (int pin)
+ {
+		int bcmGpioPin = wiringPiToBCMGPIO(pin);
+		int8_t start = START ;
+
+		if(bcmGpioPin < 0)
+			return wiringPiFailure (WPI_FATAL, "detachInterrupt: Invalid pin given - error : %d\n", bcmGpioPin) ;
+
+		/** Write dummy data on pipe output in order to terminate polling thread */
+		if(write(isrCallbacks[pin].pipeFd[1], &start, sizeof(start)) != 1)
+		{
+			return wiringPiFailure (WPI_ALMOST, "error %s when writing to pipe\n", strerror(errno)) ;
+		}
+		return 0;
+ }
+
+/*
  * detachInterrupt:
  *	Detach interrupt on given pin.
  *	'dirty' way => thread listening in it not killed
@@ -1678,11 +1814,16 @@ int  detachInterrupt     (int pin)
 {
 	int bcmGpioPin = wiringPiToBCMGPIO(pin);
 	int ret = 0;
+	int8_t det = DETACH ;
 
 	if(bcmGpioPin < 0)
 		return wiringPiFailure (WPI_FATAL, "detachInterrupt: Invalid pin given - error : %d\n", bcmGpioPin) ;
 
-	pinDetach[pin] = TRUE;
+	/** Write dummy data on pipe output in order to terminate polling thread */
+	if(write(isrCallbacks[pin].pipeFd[1], &det, sizeof det) != 1)
+	{
+		return wiringPiFailure (WPI_ALMOST, "error %s when writing to pipe\n", strerror(errno)) ;
+	}
 
 	ret = changeGPIOEdge(bcmGpioPin, INT_EDGE_NONE);
 	if(ret < 0){

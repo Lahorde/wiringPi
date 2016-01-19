@@ -200,6 +200,7 @@ extern void gpioClockSet        (int pin, int freq) ;
 
 extern int  waitForInterrupt    (int pin, int mS) ;
 extern int  wiringPiISR         (int pin, int mode, void (*function)(void*), void* payload) ;
+extern int  wiringPiISRStart    (int pin) ;
 extern int  detachInterrupt     (int pin) ;
 
 // Threads

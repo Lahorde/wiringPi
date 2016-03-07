@@ -1575,8 +1575,8 @@ int waitForInterrupt (int pin, int mS)
   polls[1].events = POLLIN ;
 
   /** clear interrupt */
-	lseek (fd, 0, SEEK_SET) ;
-	(void)read (fd, buff, sizeof buff) ;
+	//lseek (fd, 0, SEEK_SET) ;
+	//int length = read (fd, buff, sizeof buff) ;
 
   // Wait for it ...
   x = poll (polls, 2, mS) ;
@@ -1659,7 +1659,9 @@ static void *interruptHandler (void *arg)
 
   if(ret < 0)
   {
-
+  	wiringPiFailure (WPI_FATAL, "Error %s when polling in interruptHandler",
+  	    	  				strerror(errno)) ;
+  	return NULL;
   }
   else if((polls[0].revents > 0) && (polls[0].revents & POLLIN)) /** Signal to start IT */
   {
@@ -1667,19 +1669,26 @@ static void *interruptHandler (void *arg)
   	if(nbBytes == 1 && buff[0] == START) /** start interrupt catching */
   	{
   	}
+  	else if(nbBytes == 1 && buff[0] == DETACH) /** interrupt detached */
+  	{
+  		close(isrCallbacks[myPin].pipeFd[0]);
+  		close(isrCallbacks[myPin].pipeFd[1]);
+  		return NULL;
+  	}
   	else /** other message */
   	{
     	close(isrCallbacks[myPin].pipeFd[0]);
     	close(isrCallbacks[myPin].pipeFd[1]);
-  		pthread_exit(NULL);
-  		return NULL;
+    	wiringPiFailure (WPI_FATAL, "Invalid data received in pipe - nbbytes = %d",
+    	  				nbBytes) ;
+    	return NULL;
   	}
   }
   else /** other errors */
   {
   	close(isrCallbacks[myPin].pipeFd[0]);
   	close(isrCallbacks[myPin].pipeFd[1]);
-  	pthread_exit(NULL);
+  	wiringPiFailure (WPI_FATAL, "Invalid data received in pipe ") ;
   	return NULL;
   }
 
@@ -1691,7 +1700,6 @@ static void *interruptHandler (void *arg)
     	if(isrCallbacks[myPin].isrFunction == NULL)
     	{
     		wiringPiFailure (WPI_FATAL, "interruptHandler: callback is null\n") ;
-    		pthread_exit(NULL);
     		return NULL;
     	}
     	isrCallbacks[myPin].isrFunction(isrCallbacks[myPin].payload);
@@ -1699,11 +1707,9 @@ static void *interruptHandler (void *arg)
     }
     else /** it detached or error */
     {
-    	pthread_exit(NULL);
+    	return NULL;
     }
   }
-
-  return NULL ;
 }
 
 
@@ -1834,58 +1840,52 @@ int  detachInterrupt     (int pin)
 	return 0;
 }
 
-
-
-/*
- * Change GPIO edge using gpio utility
- *********************************************************************************
- */
 int changeGPIOEdge (int bcmGpioPin, int mode){
-	pid_t pid ;
-	const char *modeS ;
-	char  pinS [8] ;
+	FILE *fd ;
+	char fName [128] ;
 
-	sprintf (pinS, "%d", bcmGpioPin) ;
 
-	// Now export the pin and set the right edge
-	//	We're going to use the gpio program to do this, so it assumes
-	//	a full installation of wiringPi. It's a bit 'clunky', but it
-	//	is a way that will work when we're running in "Sys" mode, as
-	//	a non-root user. (without sudo)
-  if (mode != INT_EDGE_SETUP)
-  {
-    /**/ if (mode == INT_EDGE_FALLING)
-      modeS = "falling" ;
-    else if (mode == INT_EDGE_RISING)
-      modeS = "rising" ;
-    else if (mode == INT_EDGE_NONE)
-      modeS = "none" ;
-    else if (mode == INT_EDGE_BOTH)
-      modeS = "both" ;
-    else
-    	return wiringPiFailure (WPI_FATAL, "Bad parameter given for mode %d", mode) ;
+	// Export the pin and set direction to input
 
-    if ((pid = fork ()) < 0)	// Fail
-      return wiringPiFailure (WPI_FATAL, "wiringPiISR: fork failed: %s\n", strerror (errno)) ;
+	if ((fd = fopen ("/sys/class/gpio/export", "w")) == NULL)
+	{
+		return wiringPiFailure (WPI_FATAL, " Unable to open GPIO export interface: %s", strerror (errno)) ;
 
-    if (pid == 0)	// Child, exec
-    {
-      /**/ if (access ("/usr/local/bin/gpio", X_OK) == 0)
-      {
-      	execl ("/usr/local/bin/gpio", "gpio", "edge", pinS, modeS, (char *)NULL) ;
-      	return wiringPiFailure (WPI_FATAL, "wiringPiISR: execl failed: %s\n", strerror (errno)) ;
-      }
-      else if (access ("/usr/bin/gpio", X_OK) == 0)
-      {
-      	execl ("/usr/bin/gpio", "gpio", "edge", pinS, modeS, (char *)NULL) ;
-      	return wiringPiFailure (WPI_FATAL, "wiringPiISR: execl failed: %s\n", strerror (errno)) ;
-      }
-      else
-      	return wiringPiFailure (WPI_FATAL, "wiringPiISR: Can't find gpio program\n") ;
-    }
-    else		// Parent, wait
-      wait (NULL) ;
-  }
+	}
+
+	fprintf (fd, "%d\n", bcmGpioPin) ;
+	fclose (fd) ;
+
+	sprintf (fName, "/sys/class/gpio/gpio%d/direction", bcmGpioPin) ;
+	if ((fd = fopen (fName, "w")) == NULL)
+	{
+		return wiringPiFailure (WPI_FATAL, "Unable to open GPIO direction interface for pin %d: %s",bcmGpioPin , strerror (errno)) ;
+	}
+
+	fprintf (fd, "in\n") ;
+	fclose (fd) ;
+
+	sprintf (fName, "/sys/class/gpio/gpio%d/edge", bcmGpioPin) ;
+	if ((fd = fopen (fName, "w")) == NULL)
+	{
+		return wiringPiFailure (WPI_FATAL, "Unable to open GPIO edge interface for pin %d: %s", bcmGpioPin, strerror (errno)) ;
+	}
+
+	if (mode != INT_EDGE_SETUP)
+	{
+		/**/ if (mode == INT_EDGE_FALLING)
+			fprintf (fd, "falling\n") ;
+		else if (mode == INT_EDGE_RISING)
+			fprintf (fd, "rising\n") ;
+		else if (mode == INT_EDGE_NONE)
+			fprintf (fd, "none\n") ;
+		else if (mode == INT_EDGE_BOTH)
+			fprintf (fd, "both\n") ;
+		else
+			return wiringPiFailure (WPI_FATAL, "Bad parameter given for mode %d", mode) ;
+	}
+	fclose (fd) ;
+
 	return 0;
 }
 
